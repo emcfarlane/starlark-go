@@ -49,16 +49,14 @@ func FromKeywords(constructor starlark.Value, kwargs []starlark.Tuple) *Struct {
 	if constructor == nil {
 		panic("nil constructor")
 	}
-	members := make(starlark.StringDict, len(kwargs))
+
+	d := make(starlark.StringDict, len(kwargs))
 	for _, kwarg := range kwargs {
 		k := string(kwarg[0].(starlark.String))
 		v := kwarg[1]
-		members[k] = v
+		d[k] = v
 	}
-	return &Struct{
-		constructor: constructor,
-		members:     members,
-	}
+	return FromStringDict(constructor, d)
 }
 
 // FromStringDict returns a new struct instance whose elements are those of d.
@@ -67,14 +65,13 @@ func FromStringDict(constructor starlark.Value, d starlark.StringDict) *Struct {
 	if constructor == nil {
 		panic("nil constructor")
 	}
-	members := make(starlark.StringDict, len(d))
-	for k, v := range d {
-		members[k] = v
+
+	s := &Struct{constructor: constructor}
+	s.ht.init(len(d))
+	for _, k := range d.Keys() {
+		s.ht.insert(k, d[k])
 	}
-	return &Struct{
-		constructor: constructor,
-		members:     members,
-	}
+	return s
 }
 
 // Struct is an immutable Starlark type that maps field names to values.
@@ -94,7 +91,7 @@ func FromStringDict(constructor starlark.Value, d starlark.StringDict) *Struct {
 // Use Attr to access its fields and AttrNames to enumerate them.
 type Struct struct {
 	constructor starlark.Value
-	members     starlark.StringDict
+	ht          hashtable
 }
 
 // Default is the default constructor for structs.
@@ -108,8 +105,8 @@ var (
 
 // ToStringDict adds a name/value entry to d for each field of the struct.
 func (s *Struct) ToStringDict(d starlark.StringDict) {
-	for key, val := range s.members {
-		d[key] = val
+	for e := s.ht.head; e != nil; e = e.next {
+		d[e.key] = e.value
 	}
 }
 
@@ -123,14 +120,13 @@ func (s *Struct) String() string {
 		buf.WriteString(s.constructor.String())
 	}
 	buf.WriteByte('(')
-	for i, k := range s.members.Keys() {
-		v := s.members[k]
-		if i > 0 {
+	for e := s.ht.head; e != nil; e = e.next {
+		if e != s.ht.head {
 			buf.WriteString(", ")
 		}
-		buf.WriteString(k)
+		buf.WriteString(e.key)
 		buf.WriteString(" = ")
-		buf.WriteString(v.String())
+		buf.WriteString(e.value.String())
 	}
 	buf.WriteByte(')')
 	return buf.String()
@@ -144,10 +140,11 @@ func (s *Struct) Truth() starlark.Bool { return true } // even when empty
 func (s *Struct) Hash() (uint32, error) {
 	// Same algorithm as Tuple.hash, but with different primes.
 	var x, m uint32 = 8731, 9839
-	for _, k := range s.members.Keys() {
+	for e := s.ht.head; e != nil; e = e.next {
+		k, v := e.key, e.value
 		namehash, _ := starlark.String(k).Hash()
 		x = x ^ 3*namehash
-		y, err := s.members[k].Hash()
+		y, err := v.Hash()
 		if err != nil {
 			return 0, err
 		}
@@ -156,7 +153,7 @@ func (s *Struct) Hash() (uint32, error) {
 	}
 	return x, nil
 }
-func (s *Struct) Freeze() { s.members.Freeze() }
+func (s *Struct) Freeze() { s.ht.freeze() }
 
 func (x *Struct) Binary(op syntax.Token, y starlark.Value, side starlark.Side) (starlark.Value, error) {
 	if y, ok := y.(*Struct); ok && op == syntax.PLUS {
@@ -172,24 +169,41 @@ func (x *Struct) Binary(op syntax.Token, y starlark.Value, side starlark.Side) (
 				x.constructor, y.constructor)
 		}
 
-		z := make(starlark.StringDict, x.len()+y.len())
-		for k, v := range x.members {
-			z[k] = v
-		}
-		for k, v := range y.members {
-			z[k] = v
-		}
+		s := &Struct{constructor: x.constructor}
+		s.ht.init(x.len() + y.len())
 
-		return FromStringDict(x.constructor, z), nil
+		ex, ey := x.ht.head, y.ht.head
+		for ex != nil && ey != nil {
+			if ex.key < ey.key {
+				s.ht.insert(ex.key, ex.value)
+				ex = ex.next
+			} else if ex.key == ey.key {
+				s.ht.insert(ey.key, ey.value)
+				ex, ey = ex.next, ey.next
+			} else {
+				s.ht.insert(ey.key, ey.value)
+				ey = ey.next
+			}
+		}
+		for e := ex; e != nil; e = e.next {
+			s.ht.insert(e.key, e.value)
+		}
+		for e := ey; e != nil; e = e.next {
+			s.ht.insert(e.key, e.value)
+		}
+		return s, nil
 	}
 	return nil, nil // unhandled
 }
 
 // Attr returns the value of the specified field.
 func (s *Struct) Attr(name string) (starlark.Value, error) {
-	if v, ok := s.members[name]; ok {
+	if v, ok, err := s.ht.lookup(name); ok {
 		return v, nil
+	} else if err != nil {
+		return nil, err
 	}
+
 	var ctor string
 	if s.constructor != Default {
 		ctor = s.constructor.String() + " "
@@ -198,10 +212,16 @@ func (s *Struct) Attr(name string) (starlark.Value, error) {
 		fmt.Sprintf("%sstruct has no .%s attribute", ctor, name))
 }
 
-func (s *Struct) len() int { return len(s.members) }
+func (s *Struct) len() int { return int(s.ht.len) }
 
 // AttrNames returns a new sorted list of the struct fields.
-func (s *Struct) AttrNames() []string { return s.members.Keys() }
+func (s *Struct) AttrNames() []string {
+	keys := make([]string, 0, int(s.ht.len))
+	for e := s.ht.head; e != nil; e = e.next {
+		keys = append(keys, e.key)
+	}
+	return keys
+}
 
 func (x *Struct) CompareSameType(op syntax.Token, y_ starlark.Value, depth int) (bool, error) {
 	y := y_.(*Struct)
@@ -230,31 +250,15 @@ func structsEqual(x, y *Struct, depth int) (bool, error) {
 		return false, nil
 	}
 
-	// Loop over every key returning the lowest error by key, if any.
-	var (
-		key string
-		err error
-	)
-	setErr := func(k string, e error) {
-		if err == nil || k < key {
-			key = k
-			err = e
-		}
-	}
-	for k, xv := range x.members {
-		if yv, ok := y.members[k]; !ok {
-			setErr(k, errNotEqual)
-		} else if eq, err := starlark.EqualDepth(xv, yv, depth-1); err != nil {
-			setErr(k, err)
-		} else if !eq {
-			setErr(k, errNotEqual)
-		}
-	}
-	if err != nil {
-		if err == errNotEqual {
+	for ex, ey := x.ht.head, y.ht.head; ex != nil; ex, ey = ex.next, ey.next {
+		if ex.key != ey.key {
 			return false, nil
 		}
-		return false, err
+		if eq, err := starlark.EqualDepth(ex.value, ey.value, depth-1); err != nil {
+			return false, err
+		} else if !eq {
+			return false, nil
+		}
 	}
 	return true, nil
 }
