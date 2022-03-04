@@ -7,6 +7,7 @@ package starlark
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"testing"
 )
@@ -54,6 +55,8 @@ var (
 		Int   Int
 		goInt int
 	}
+	testStrings    [3 * testIters]string
+	testStringDict StringDict = make(StringDict)
 )
 
 func makeTestInts() {
@@ -62,6 +65,9 @@ func makeTestInts() {
 		r := int(zipf.Uint64())
 		testInts[i].goInt = r
 		testInts[i].Int = MakeInt(r)
+		s := strconv.Itoa(r)
+		testStrings[i] = s
+		testStringDict[s] = None
 	}
 }
 
@@ -119,6 +125,50 @@ func testHashtable(tb testing.TB, sane map[int]bool) {
 
 	if sane != nil {
 		if int(ht.len) != len(sane) {
+			tb.Fatal("sanity check failed")
+		}
+	}
+}
+
+func TestOrderedStringDict(t *testing.T) {
+	makeTestIntsOnce.Do(makeTestInts)
+	testOrderedStringDict(t, make(StringDict))
+}
+
+func testOrderedStringDict(tb testing.TB, sane StringDict) {
+	var i int // index into testInts
+
+	// Build the maps
+	// Insert 10000 random ints into the map.
+	d := NewOrderedStringDict(testStringDict)
+	for k, v := range testStringDict {
+		sane[k] = v
+	}
+
+	// Do 10000 random lookups in the map.
+	for j := 0; j < testIters; j++ {
+		k := testStrings[i]
+		i++
+		_, found := d.Get(k)
+		if sane != nil {
+			_, found2 := sane[k]
+			if found != found2 {
+				tb.Fatal("sanity check failed")
+			}
+		}
+	}
+
+	// Do 10000 random sets from the map.
+	for j := 0; j < testIters; j++ {
+		k := testStrings[i]
+		i++
+		if err := d.Set(k, None); err != nil {
+			tb.Fatal(err)
+		}
+	}
+
+	if sane != nil {
+		if len(d.entries) != len(sane) {
 			tb.Fatal("sanity check failed")
 		}
 	}
