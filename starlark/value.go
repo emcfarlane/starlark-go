@@ -714,14 +714,20 @@ func (fn *Function) Param(i int) (string, syntax.Position) {
 func (fn *Function) HasVarargs() bool { return fn.funcode.HasVarargs }
 func (fn *Function) HasKwargs() bool  { return fn.funcode.HasKwargs }
 
-// A Builtin is a function implemented in Go.
-type Builtin struct {
+type builtin struct {
 	name string
 	fn   func(thread *Thread, fn *Builtin, args Tuple, kwargs []Tuple) (Value, error)
+}
+
+// A Builtin is a function implemented in Go.
+type Builtin struct {
+	*builtin
 	recv Value // for bound methods (e.g. "".startswith)
 }
 
-func (b *Builtin) Name() string { return b.name }
+func (b *Builtin) Name() string {
+	return b.name
+}
 func (b *Builtin) Freeze() {
 	if b.recv != nil {
 		b.recv.Freeze()
@@ -736,7 +742,12 @@ func (b *Builtin) Hash() (uint32, error) {
 }
 func (b *Builtin) Receiver() Value { return b.recv }
 func (b *Builtin) String() string  { return toString(b) }
-func (b *Builtin) Type() string    { return "builtin_function_or_method" }
+func (b *Builtin) Type() string {
+	if b.recv != nil {
+		return "builtin_method"
+	}
+	return "builtin_function"
+}
 func (b *Builtin) CallInternal(thread *Thread, args Tuple, kwargs []Tuple) (Value, error) {
 	return b.fn(thread, b, args, kwargs)
 }
@@ -745,7 +756,7 @@ func (b *Builtin) Truth() Bool { return true }
 // NewBuiltin returns a new 'builtin_function_or_method' value with the specified name
 // and implementation.  It compares unequal with all other values.
 func NewBuiltin(name string, fn func(thread *Thread, fn *Builtin, args Tuple, kwargs []Tuple) (Value, error)) *Builtin {
-	return &Builtin{name: name, fn: fn}
+	return &Builtin{builtin: &builtin{name: name, fn: fn}}
 }
 
 // BindReceiver returns a new Builtin value representing a method
@@ -762,7 +773,7 @@ func NewBuiltin(name string, fn func(thread *Thread, fn *Builtin, args Tuple, kw
 //     "abc".index("a")
 //
 func (b *Builtin) BindReceiver(recv Value) *Builtin {
-	return &Builtin{name: b.name, fn: b.fn, recv: recv}
+	return &Builtin{builtin: b.builtin, recv: recv}
 }
 
 // A *Dict represents a Starlark dictionary.
